@@ -236,6 +236,7 @@ func InitUser(username string, password string) (userDataPtr *User, err error) {
 
 func GetUser(username string, password string) (userDataPtr *User, err error) {
 	var userdata User
+
 	userDataPtr = &userdata
 	return userDataPtr, nil
 }
