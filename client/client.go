@@ -108,29 +108,136 @@ func someUsefulThings() {
 // This is the type definition for the User struct.
 // A Go struct is like a Python or Java class - it can have attributes
 // (e.g. like the Username attribute) and methods (e.g. like the StoreFile method below).
+
+// You can add other attributes here if you want! But note that in order for attributes to
+// be included when this struct is serialized to/from JSON, they must be capitalized.
+// On the flipside, if you have an attribute that you want to be able to access from
+// this struct's methods, but you DON'T want that value to be included in the serialized value
+// of this struct that's stored in datastore, then you can use a "private" variable (e.g. one that
+// begins with a lowercase letter).
+
+// SECTION I: SELF-DEFINE STRUCTS
+
 type User struct {
 	Username string
+	SymKey   []byte
+	DecKey   userlib.PKEDecKey
+	SignKey  userlib.DSSignKey
+}
 
-	// You can add other attributes here if you want! But note that in order for attributes to
-	// be included when this struct is serialized to/from JSON, they must be capitalized.
-	// On the flipside, if you have an attribute that you want to be able to access from
-	// this struct's methods, but you DON'T want that value to be included in the serialized value
-	// of this struct that's stored in datastore, then you can use a "private" variable (e.g. one that
-	// begins with a lowercase letter).
+type UUIDFile struct {
+	UUID   uuid.UUID
+	SymKey []byte
+}
+
+type FileHead struct {
+	Start   uuid.UUID
+	Counter int
+}
+
+type FilePiece string
+
+type ShareInfo struct {
+	FileSymKey    []byte
+	FileLocSymKey []byte
+	uuidBranch    uuid.UUID
+}
+
+type InvitationGraph map[string]uuid.UUID
+
+// SECTION II: HELPER FUNCTIONS
+
+func getUuidFromUsername(username string) (id uuid.UUID, err error) {
+	return uuid.FromBytes(userlib.Hash([]byte(username))[:16])
+}
+
+func ValidateUserInitialization(username string) (valid bool) {
+	userUUID, err := getUuidFromUsername(username)
+	if err == nil {
+		_, ok := userlib.DatastoreGet(userUUID)
+		return !ok
+	}
+	return false
+}
+
+func PasswordGenSymKey(password string, username string) (SymKey []byte) {
+	//remark: the length is 16 bytes
+	return userlib.Argon2Key([]byte(password), []byte(username), 16)
+}
+
+func EncKeyNameOfUser(username string) (EncKeyName string) {
+	return username + "EncKey"
+}
+
+func VerKeyNameOfUser(username string) (VerKeyName string) {
+	return username + "VerKey"
+}
+
+func UserEncSymKey(SymKey []byte) (derivedKey []byte, err error) {
+	return userlib.HashKDF(SymKey, []byte("UserEncSymKey"))
+}
+
+func UserHmacKey(SymKey []byte) (derivedKey []byte, err error) {
+	return userlib.HashKDF(SymKey, []byte("UserHmacKey"))
 }
 
 // NOTE: The following methods have toy (insecure!) implementations.
 
-func InitUser(username string, password string) (userdataptr *User, err error) {
+func InitUser(username string, password string) (userDataPtr *User, err error) {
 	var userdata User
+	valid := ValidateUserInitialization(username)
+	if !valid {
+		return nil, errors.New("invalid username")
+	}
+
 	userdata.Username = username
+	userdata.SymKey = PasswordGenSymKey(password, username)
+
+	pub, pri, PKEKeyGenErr := userlib.PKEKeyGen()
+	if PKEKeyGenErr != nil {
+		return nil, PKEKeyGenErr
+	}
+	userdata.DecKey = pri
+	KeystoreSetErr := userlib.KeystoreSet(EncKeyNameOfUser(username), pub)
+	if KeystoreSetErr != nil {
+		return nil, KeystoreSetErr
+	}
+
+	sign, ver, DSKeyGenErr := userlib.DSKeyGen()
+	if DSKeyGenErr != nil {
+		return nil, DSKeyGenErr
+	}
+	userdata.SignKey = sign
+	KeystoreSetErr = userlib.KeystoreSet(VerKeyNameOfUser(username), ver)
+	if KeystoreSetErr != nil {
+		return nil, KeystoreSetErr
+	}
+
+	userEncSymKey, UserEncSymKeyErr := UserEncSymKey(userdata.SymKey)
+	if UserEncSymKeyErr != nil {
+		return nil, UserEncSymKeyErr
+	}
+	userHmacKey, UserHmacKeyErr := UserHmacKey(userdata.SymKey)
+	if UserHmacKeyErr != nil {
+		return nil, UserHmacKeyErr
+	}
+	userBytes, MarshalErr := json.Marshal(&userdata)
+	if MarshalErr != nil {
+		return nil, MarshalErr
+	}
+	uuidFromUsername, _ := getUuidFromUsername(username)
+	userBytes = userlib.SymEnc(userEncSymKey, userlib.RandomBytes(16), userBytes)
+	hmacUb, _ := userlib.HMACEval(userHmacKey, userBytes)
+	userBytes = append(userBytes, hmacUb...)
+	userlib.DatastoreSet(uuidFromUsername, userBytes)
+
 	return &userdata, nil
 }
 
-func GetUser(username string, password string) (userdataptr *User, err error) {
+func GetUser(username string, password string) (userDataPtr *User, err error) {
 	var userdata User
-	userdataptr = &userdata
-	return userdataptr, nil
+	userDataPtr = &userdata
+	return userDataPtr, nil
 }
 
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
