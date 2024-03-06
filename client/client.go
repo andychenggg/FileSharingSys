@@ -15,6 +15,7 @@ package client
 // - strings
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 
@@ -124,8 +125,9 @@ type User struct {
 }
 
 type UUIDFile struct {
-	UUID   uuid.UUID
-	SymKey []byte
+	UUID        uuid.UUID
+	SymKey      []byte
+	CreatorHash []byte
 }
 
 type FileHead struct {
@@ -136,12 +138,14 @@ type FileHead struct {
 type FilePiece []byte
 
 type ShareInfo struct {
-	FileSymKey    []byte
-	FileLocSymKey []byte
-	uuidBranch    uuid.UUID
+	FileSymKey  []byte
+	uuidBranch  uuid.UUID
+	CreatorHash []byte
 }
 
 type InvitationGraph map[string]uuid.UUID
+
+type FileList map[string]bool
 
 type DatastoreGetError struct {
 	Msg string
@@ -149,6 +153,14 @@ type DatastoreGetError struct {
 
 func (e *DatastoreGetError) Error() string {
 	return fmt.Sprintf("DatastoreGet error: %s", e.Msg)
+}
+
+type KeystoreGetError struct {
+	Msg string
+}
+
+func (e *KeystoreGetError) Error() string {
+	return fmt.Sprintf("KeystoreGet error: %s", e.Msg)
 }
 
 type HmacCheckError struct {
@@ -159,18 +171,26 @@ func (e *HmacCheckError) Error() string {
 	return fmt.Sprintf("Hmac error: %s", e.Msg)
 }
 
+type RSACheckErr struct {
+	Msg string
+}
+
+func (e *RSACheckErr) Error() string {
+	return fmt.Sprintf("RSA signing error: %s", e.Msg)
+}
+
 // SECTION II: LOCAL VARIABLES
 
 var curUser User
 
 // SECTION III: HELPER FUNCTIONS
 
-func getUuidFromUsername(username string) (id uuid.UUID, err error) {
-	return uuid.FromBytes(userlib.Hash([]byte(username))[:16])
+func getUuidFromUsername(username string, start int) (id uuid.UUID, err error) {
+	return uuid.FromBytes(userlib.Hash([]byte(username))[start : start+16])
 }
 
 func ValidateUser(username string, exist bool) (valid bool) {
-	userUUID, err := getUuidFromUsername(username)
+	userUUID, err := getUuidFromUsername(username, 0)
 	if err == nil {
 		_, ok := userlib.DatastoreGet(userUUID)
 		return ok == exist
@@ -183,11 +203,11 @@ func PasswordGenSymKey(password string, username string) (SymKey []byte) {
 	return userlib.Argon2Key([]byte(password), []byte(username), 16)
 }
 
-func EncKeyNameOfUser(username string) (EncKeyName string) {
+func PKEncKeyNameOfUser(username string) (EncKeyName string) {
 	return username + "EncKey"
 }
 
-func VerKeyNameOfUser(username string) (VerKeyName string) {
+func DSVerKeyNameOfUser(username string) (VerKeyName string) {
 	return username + "VerKey"
 }
 
@@ -199,13 +219,13 @@ func HmacKeyGen(SymKey []byte) (derivedKey []byte, err error) {
 	return userlib.HashKDF(SymKey, []byte("HmacKey"))
 }
 
-func DatastoreSet(encKey []byte, hmacKey []byte, address uuid.UUID, v interface{}) (err error) {
+func DatastoreSymSet(encKey []byte, signKey []byte, address uuid.UUID, v interface{}) (err error) {
 	userBytes, MarshalErr := json.Marshal(v)
 	if MarshalErr != nil {
 		return MarshalErr
 	}
 	userBytes = userlib.SymEnc(encKey, userlib.RandomBytes(16), userBytes)
-	hmacUb, HMACEvalErr := userlib.HMACEval(hmacKey, userBytes)
+	hmacUb, HMACEvalErr := userlib.HMACEval(signKey, userBytes)
 	if HMACEvalErr != nil {
 		return HMACEvalErr
 	}
@@ -214,13 +234,31 @@ func DatastoreSet(encKey []byte, hmacKey []byte, address uuid.UUID, v interface{
 	return nil
 }
 
-func DatastoreGet(decKey []byte, hmacKey []byte, address uuid.UUID, obj interface{}) (err error) {
+func DatastoreAsySet(encKey userlib.PKEEncKey, signKey userlib.DSSignKey, address uuid.UUID, v interface{}) (err error) {
+	userBytes, MarshalErr := json.Marshal(v)
+	if MarshalErr != nil {
+		return MarshalErr
+	}
+	userBytes, err = userlib.PKEEnc(encKey, userBytes)
+	if err != nil {
+		return err
+	}
+	signature, err := userlib.DSSign(signKey, userBytes)
+	if err != nil {
+		return err
+	}
+	userBytes = append(userBytes, signature...)
+	userlib.DatastoreSet(address, userBytes)
+	return nil
+}
+
+func DatastoreSymGet(decKey []byte, verKey []byte, address uuid.UUID, obj interface{}) (err error) {
 	value, ok := userlib.DatastoreGet(address)
 	if !ok {
 		return &DatastoreGetError{"invalid address"}
 	}
 	// INFO: check the hmac
-	temp, hmacErr := userlib.HMACEval(hmacKey, value[:len(value)-64])
+	temp, hmacErr := userlib.HMACEval(verKey, value[:len(value)-64])
 	if hmacErr != nil {
 		return hmacErr
 	}
@@ -231,6 +269,30 @@ func DatastoreGet(decKey []byte, hmacKey []byte, address uuid.UUID, obj interfac
 	// INFO: decrypt data
 	userBytes := userlib.SymDec(decKey, value[len(value)-64:])
 	// INFO: unmarshal data
+	unmarshalErr := json.Unmarshal(userBytes, obj)
+	if unmarshalErr != nil {
+		return unmarshalErr
+	}
+
+	return nil
+}
+
+func DatastoreAsyGet(decKey userlib.PKEDecKey, verKey userlib.DSVerifyKey, address uuid.UUID, obj interface{}) (err error) {
+	value, ok := userlib.DatastoreGet(address)
+	if !ok {
+		return &DatastoreGetError{"invalid address"}
+	}
+	// INFO: check the hmac
+	err = userlib.DSVerify(verKey, value[:len(value)-256], value[len(value)-256:])
+	if err != nil {
+		return &RSACheckErr{"integrity check fails"}
+	}
+	// INFO: decrypt data
+	userBytes, err := userlib.PKEDec(decKey, value[len(value)-256:])
+	// INFO: unmarshal data
+	if err != nil {
+		return err
+	}
 	unmarshalErr := json.Unmarshal(userBytes, obj)
 	if unmarshalErr != nil {
 		return unmarshalErr
@@ -261,11 +323,12 @@ func getUUIDFromStartAndIndex(start []byte, index int) (id uuid.UUID, err error)
 	return uuid.FromBytes(userlib.Hash(res)[:16])
 }
 
-func InitUUIDFile(id uuid.UUID, decKey []byte, verKey []byte) (uf *UUIDFile, addOfFileHead *uuid.UUID, fh *FileHead, err error) {
+func InitUUIDFile(id uuid.UUID, decKey []byte, verKey []byte, username string) (uf *UUIDFile, addOfFileHead *uuid.UUID, fh *FileHead, err error) {
 	// INFO: create a UUIDFile and store it
 	uf.UUID = uuid.New()
 	uf.SymKey = userlib.RandomBytes(16)
-	dataStoreSetErr := DatastoreSet(decKey, verKey, id, *uf)
+	uf.CreatorHash = userlib.Hash([]byte(username))
+	dataStoreSetErr := DatastoreSymSet(decKey, verKey, id, *uf)
 	if dataStoreSetErr != nil {
 		return nil, nil, nil, dataStoreSetErr
 	}
@@ -280,13 +343,13 @@ func InitUUIDFile(id uuid.UUID, decKey []byte, verKey []byte) (uf *UUIDFile, add
 	}
 	// INFO: store the address of the FileHead in the uf.UUID
 	*addOfFileHead = uuid.New()
-	dataStoreSetErr = DatastoreSet(encKey, hmacKey, uf.UUID, addOfFileHead)
+	dataStoreSetErr = DatastoreSymSet(encKey, hmacKey, uf.UUID, addOfFileHead)
 	if dataStoreSetErr != nil {
 		return nil, nil, nil, dataStoreSetErr
 	}
 	// INFO: init a FileHead
 	*fh = FileHead{Start: userlib.RandomBytes(16), Counter: 0}
-	dataStoreSetErr = DatastoreSet(encKey, hmacKey, *addOfFileHead, fh)
+	dataStoreSetErr = DatastoreSymSet(encKey, hmacKey, *addOfFileHead, fh)
 	if dataStoreSetErr != nil {
 		return nil, nil, nil, dataStoreSetErr
 	}
@@ -295,7 +358,7 @@ func InitUUIDFile(id uuid.UUID, decKey []byte, verKey []byte) (uf *UUIDFile, add
 
 func GetUUIDFile(id uuid.UUID, decKey []byte, verKey []byte) (uf *UUIDFile, addOfFileHead *uuid.UUID, fh *FileHead, err error) {
 	// INFO: get and check the integrity of the existed one
-	datastoreGetErr := DatastoreGet(decKey, verKey, id, uf)
+	datastoreGetErr := DatastoreSymGet(decKey, verKey, id, uf)
 	if datastoreGetErr != nil {
 		return nil, nil, nil, err
 	}
@@ -309,12 +372,12 @@ func GetUUIDFile(id uuid.UUID, decKey []byte, verKey []byte) (uf *UUIDFile, addO
 		return nil, nil, nil, hmacKeyErr
 	}
 	// INFO: get the uuid -> FileHead by querying uuid -> uuid -> FileHead and check integrity
-	datastoreGetErr = DatastoreGet(encKey, hmacKey, (*uf).UUID, addOfFileHead)
+	datastoreGetErr = DatastoreSymGet(encKey, hmacKey, (*uf).UUID, addOfFileHead)
 	if datastoreGetErr != nil {
 		return nil, nil, nil, err
 	}
 	// INFO: get the FileHead by querying uuid -> FileHead
-	datastoreGetErr = DatastoreGet(encKey, hmacKey, *addOfFileHead, fh)
+	datastoreGetErr = DatastoreSymGet(encKey, hmacKey, *addOfFileHead, fh)
 	if datastoreGetErr != nil {
 		return nil, nil, nil, err
 	}
@@ -335,7 +398,7 @@ func ReinitializeFile(addOfFileHead *uuid.UUID, fh *FileHead, encKey []byte, hma
 		Start:   userlib.RandomBytes(16),
 		Counter: 0,
 	}
-	datastoreSetErr := DatastoreSet(encKey, hmacKey, *addOfFileHead, fh)
+	datastoreSetErr := DatastoreSymSet(encKey, hmacKey, *addOfFileHead, fh)
 	return datastoreSetErr
 }
 
@@ -345,13 +408,13 @@ func AppendContent(aof *uuid.UUID, fh *FileHead, content FilePiece, encKey []byt
 		return idErr
 	}
 	// INFO: append the content
-	datastoreSetErr := DatastoreSet(encKey, hmacKey, id, content)
+	datastoreSetErr := DatastoreSymSet(encKey, hmacKey, id, content)
 	if datastoreSetErr != nil {
 		return datastoreSetErr
 	}
 	// INFO: counter++
 	fh.Counter++
-	datastoreSetErr = DatastoreSet(encKey, hmacKey, *aof, fh)
+	datastoreSetErr = DatastoreSymSet(encKey, hmacKey, *aof, fh)
 	return datastoreSetErr
 }
 
@@ -364,13 +427,65 @@ func IterateContent(fh *FileHead, fileDecKey []byte, fileHmacKey []byte) (conten
 			return nil, idErr
 		}
 		fp := make([]byte, 0)
-		dtgErr := DatastoreGet(fileDecKey, fileHmacKey, id, &fp)
+		dtgErr := DatastoreSymGet(fileDecKey, fileHmacKey, id, &fp)
 		if dtgErr != nil {
 			return nil, dtgErr
 		}
 		content = append(content, fp...)
 	}
 	return content, nil
+}
+
+func UUIDOfInvitationGraph(username string, filename string) (id uuid.UUID, err error) {
+	return uuid.FromBytes(
+		userlib.Hash(
+			append(
+				userlib.Hash([]byte(username)), userlib.Hash([]byte(filename))...,
+			),
+		)[16:32],
+	)
+}
+
+func moveFileHead(fileEncKey []byte, fileHmacKey []byte, orgId uuid.UUID, newId uuid.UUID) (err error) {
+	// INFO: get the file head
+	var fh *FileHead
+	err = DatastoreSymGet(fileEncKey, fileHmacKey, orgId, fh)
+	if err != nil {
+		return err
+	}
+	newStart := userlib.RandomBytes(16)
+	for i := 0; i < fh.Counter; i++ {
+		// INFO: get the uuid
+		id, idErr := getUUIDFromStartAndIndex(fh.Start, i)
+		if idErr != nil {
+			return idErr
+		}
+		nid, nidErr := getUUIDFromStartAndIndex(newStart, i)
+		if nidErr != nil {
+			return nidErr
+		}
+		// INFO: move the file piece to new place
+		var fp *FilePiece
+		err = DatastoreSymGet(fileEncKey, fileHmacKey, id, fp)
+		if err != nil {
+			return err
+		}
+		err = DatastoreSymSet(fileEncKey, fileHmacKey, nid, fp)
+		if err != nil {
+			return err
+		}
+		userlib.DatastoreDelete(id)
+	}
+	// INFO: replace the start with a new one
+	fh.Start = newStart
+	// INFO: set the new file head
+	err = DatastoreSymSet(fileEncKey, fileHmacKey, newId, fh)
+	if err != nil {
+		return err
+	}
+	// INFO: delete the original file head
+	userlib.DatastoreDelete(orgId)
+	return nil
 }
 
 // SECTION IV: main functions
@@ -391,7 +506,7 @@ func InitUser(username string, password string) (userDataPtr *User, err error) {
 		return nil, PKEKeyGenErr
 	}
 	userdata.DecKey = pri
-	KeystoreSetErr := userlib.KeystoreSet(EncKeyNameOfUser(username), pub)
+	KeystoreSetErr := userlib.KeystoreSet(PKEncKeyNameOfUser(username), pub)
 	if KeystoreSetErr != nil {
 		return nil, KeystoreSetErr
 	}
@@ -401,7 +516,7 @@ func InitUser(username string, password string) (userDataPtr *User, err error) {
 		return nil, DSKeyGenErr
 	}
 	userdata.SignKey = sign
-	KeystoreSetErr = userlib.KeystoreSet(VerKeyNameOfUser(username), ver)
+	KeystoreSetErr = userlib.KeystoreSet(DSVerKeyNameOfUser(username), ver)
 	if KeystoreSetErr != nil {
 		return nil, KeystoreSetErr
 	}
@@ -415,14 +530,24 @@ func InitUser(username string, password string) (userDataPtr *User, err error) {
 		return nil, UserHmacKeyErr
 	}
 	// INFO: encrypt-then-hmac the data and write it into the datastore
-	uuidFromUsername, uuidErr := getUuidFromUsername(username)
+	uuidFromUsername, uuidErr := getUuidFromUsername(username, 0)
 	if uuidErr != nil {
 		return nil, uuidErr
 	}
-	datastoreSetErr := DatastoreSet(userEncSymKey, userHmacKey, uuidFromUsername, &userdata)
+	datastoreSetErr := DatastoreSymSet(userEncSymKey, userHmacKey, uuidFromUsername, &userdata)
 	if datastoreSetErr != nil {
 		return nil, datastoreSetErr
 	}
+	// INFO: create a file list for an user
+	uuidFromUsername, uuidErr = getUuidFromUsername(username, 16)
+	if uuidErr != nil {
+		return nil, uuidErr
+	}
+	datastoreSetErr = DatastoreSymSet(userEncSymKey, userHmacKey, uuidFromUsername, &FileList{})
+	if datastoreSetErr != nil {
+		return nil, datastoreSetErr
+	}
+
 	// INFO: store userdata in local var
 	curUser = userdata
 
@@ -448,12 +573,12 @@ func GetUser(username string, password string) (userDataPtr *User, err error) {
 		return nil, UserHmacKeyErr
 	}
 	// INFO: get data from store
-	uuidFromUsername, uuidErr := getUuidFromUsername(username)
+	uuidFromUsername, uuidErr := getUuidFromUsername(username, 0)
 	if uuidErr != nil {
 		return nil, uuidErr
 	}
 	userDataPtr = &userdata
-	datastoreErr := DatastoreGet(
+	datastoreErr := DatastoreSymGet(
 		userEncSymKey, userHmacKey, uuidFromUsername, userDataPtr,
 	)
 	if datastoreErr != nil {
@@ -479,19 +604,46 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 	if UserHmacKeyErr != nil {
 		return UserHmacKeyErr
 	}
-	// INFO: Init or get the file structure
-	_, ok := userlib.DatastoreGet(storageKey)
+	// INFO: searching the FileList in case that the file have been deleted
+	uuidFromUsername, uuidErr := getUuidFromUsername(userdata.Username, 16)
+	if uuidErr != nil {
+		return uuidErr
+	}
+	var fl *FileList
+	datastoreGetErr := DatastoreSymGet(userEncSymKey, userHmacKey, uuidFromUsername, fl)
+	if datastoreGetErr != nil {
+		return datastoreGetErr
+	}
+	_, ok := (*fl)[filename]
 	var uf *UUIDFile
 	var aof *uuid.UUID
 	var fh *FileHead
+	// INFO: not in the file list
 	if !ok {
+		// INFO: insert a new filename in the list
+		(*fl)[filename] = true
+		datastoreSetErr := DatastoreSymSet(userEncSymKey, userHmacKey, uuidFromUsername, fl)
+		if datastoreSetErr != nil {
+			return datastoreSetErr
+		}
 		// INFO: create a new file
-		uf, aof, fh, err = InitUUIDFile(storageKey, userEncSymKey, userHmacKey)
+		uf, aof, fh, err = InitUUIDFile(storageKey, userEncSymKey, userHmacKey, userdata.Username)
 		if err != nil {
 			return err
 		}
+		// INFO: if this guy is the creator, create an invitationGraph
+		if bytes.Equal(uf.CreatorHash, userlib.Hash([]byte(userdata.Username))) {
+			id, err := UUIDOfInvitationGraph(userdata.Username, filename)
+			if err != nil {
+				return err
+			}
+			err = DatastoreSymSet(userEncSymKey, userHmacKey, id, InvitationGraph{})
+			if err != nil {
+				return err
+			}
+		}
 	} else {
-		// INFO: get the current one
+		// INFO: in the file list -> get the current one
 		uf, aof, fh, err = GetUUIDFile(storageKey, userEncSymKey, userHmacKey)
 		if err != nil {
 			return err
@@ -516,6 +668,7 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 	if appErr != nil {
 		return appErr
 	}
+
 	return nil
 }
 
@@ -598,15 +751,199 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 	}
 }
 
-func (userdata *User) CreateInvitation(filename string, recipientUsername string) (
-	invitationPtr uuid.UUID, err error) {
+func (userdata *User) CreateInvitation(filename string, recipientUsername string) (invitationPtr uuid.UUID, err error) {
+	/*
+		FLow:
+		1. check whether an invitation graph exists. If not, create one
+		2.
+	*/
+	// INFO: check whether the user exists
+	valid := ValidateUser(recipientUsername, true)
+	if !valid {
+		return uuid.New(), &DatastoreGetError{"the user does not exist"}
+	}
+	// INFO: check the current user with filename
+	uid, err := AddressOfUUIDFileGen(userdata.Username, filename)
+	// INFO: generate keys for users' encryption/decryption and hmac
+	userEncSymKey, UserEncSymKeyErr := EncSymKeyGen(userdata.SymKey)
+	if UserEncSymKeyErr != nil {
+		return uuid.New(), UserEncSymKeyErr
+	}
+	userHmacKey, UserHmacKeyErr := HmacKeyGen(userdata.SymKey)
+	if UserHmacKeyErr != nil {
+		return uuid.New(), UserHmacKeyErr
+	}
+
+	// INFO: retrieve the file from the ds
+	uf, aof, _, err := GetUUIDFile(uid, userEncSymKey, userHmacKey)
+	if err != nil {
+		return uuid.New(), err
+	}
+	// INFO: key generations
+	fileEncKey, encKeyErr := EncSymKeyGen(uf.SymKey)
+	if encKeyErr != nil {
+		return uuid.New(), encKeyErr
+	}
+	fileHmacKey, hmacKeyErr := HmacKeyGen(uf.SymKey)
+	if hmacKeyErr != nil {
+		return uuid.New(), hmacKeyErr
+	}
+	// INFO: check whether this guy is the creator
+	var uuidBranch uuid.UUID
+	if bytes.Equal(uf.CreatorHash, userlib.Hash([]byte(userdata.Username))) {
+		// INFO: is creator
+		// INFO: check whether an invitation graph exists.
+		id, err := UUIDOfInvitationGraph(userdata.Username, filename)
+		if err != nil {
+			return uuid.New(), err
+		}
+		// INFO: get the invitation graph
+		var ig InvitationGraph
+		err = DatastoreSymGet(userEncSymKey, userHmacKey, id, &ig)
+		if err != nil {
+			return uuid.New(), err
+		}
+		// INFO: insert a username:uuidBranch pair
+		uuidBranch = uuid.New()
+		ig[recipientUsername] = uuidBranch
+		// INFO: let uuidBranch point to the fileHead
+		err = DatastoreSymSet(fileEncKey, fileHmacKey, uuidBranch, *aof)
+	} else {
+		// INFO: not the creator
+		// INFO: let the uuidBranch same as the uf.UUID
+		uuidBranch = uf.UUID
+	}
+	// INFO: initialize the invitationPtr
+	invitationPtr = uuid.New()
+	// INFO: initialize the shareInfo
+	sfo := &ShareInfo{FileSymKey: uf.SymKey, uuidBranch: uuidBranch, CreatorHash: uf.CreatorHash}
+	// INFO: retrieve the PKEncKey of the recipient
+	value, ok := userlib.KeystoreGet(PKEncKeyNameOfUser(recipientUsername))
+	if !ok {
+		return uuid.New(), &KeystoreGetError{fmt.Sprintf("cannot find %s's PKEncKey", recipientUsername)}
+	}
+	// INFO: store the shareInfo
+	err = DatastoreAsySet(value, userdata.SignKey, invitationPtr, sfo)
+
 	return
 }
 
-func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) error {
+func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid.UUID, filename string) (err error) {
+	// INFO: retrieve the DSVerKey of the recipient
+	value, ok := userlib.KeystoreGet(DSVerKeyNameOfUser(senderUsername))
+	if !ok {
+		return &KeystoreGetError{fmt.Sprintf("cannot find %s's DSVerKey", senderUsername)}
+	}
+	// INFO: retrieve the shareInfo
+	var sfo *ShareInfo
+	err = DatastoreAsyGet(userdata.DecKey, value, invitationPtr, sfo)
+	if err != nil {
+		return err
+	}
+	// INFO: generate keys for users' encryption/decryption and hmac
+	userEncSymKey, UserEncSymKeyErr := EncSymKeyGen(userdata.SymKey)
+	if UserEncSymKeyErr != nil {
+		return UserEncSymKeyErr
+	}
+	userHmacKey, UserHmacKeyErr := HmacKeyGen(userdata.SymKey)
+	if UserHmacKeyErr != nil {
+		return UserHmacKeyErr
+	}
+	// INFO: searching the FileList in case that the file have been maliciously deleted
+	uuidFromUsername, uuidErr := getUuidFromUsername(userdata.Username, 16)
+	if uuidErr != nil {
+		return uuidErr
+	}
+	var fl *FileList
+	datastoreGetErr := DatastoreSymGet(userEncSymKey, userHmacKey, uuidFromUsername, fl)
+	if datastoreGetErr != nil {
+		return datastoreGetErr
+	}
+	_, ok = (*fl)[filename]
+	if ok {
+		// INFO: already in the file list
+		return &DatastoreGetError{"this name already in the file list"}
+	}
+	// INFO: insert a new filename in the list
+	(*fl)[filename] = true
+	datastoreSetErr := DatastoreSymSet(userEncSymKey, userHmacKey, uuidFromUsername, fl)
+	if datastoreSetErr != nil {
+		return datastoreSetErr
+	}
+	// INFO: create a file in the namespace
+	ufStKey, addGenErr := AddressOfUUIDFileGen(userdata.Username, filename)
+	if addGenErr != nil {
+		return addGenErr
+	}
+	// INFO: create a new file
+	uf := &UUIDFile{UUID: sfo.uuidBranch, SymKey: sfo.FileSymKey, CreatorHash: sfo.CreatorHash}
+	err = DatastoreSymSet(userEncSymKey, userHmacKey, ufStKey, uf)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
 func (userdata *User) RevokeAccess(filename string, recipientUsername string) error {
+	// INFO: check whether their is a file with such file name
+	// INFO: check the current user with filename
+	uid, err := AddressOfUUIDFileGen(userdata.Username, filename)
+	// INFO: generate keys for users' encryption/decryption and hmac
+	userEncSymKey, UserEncSymKeyErr := EncSymKeyGen(userdata.SymKey)
+	if UserEncSymKeyErr != nil {
+		return UserEncSymKeyErr
+	}
+	userHmacKey, UserHmacKeyErr := HmacKeyGen(userdata.SymKey)
+	if UserHmacKeyErr != nil {
+		return UserHmacKeyErr
+	}
+	// INFO: retrieve the file from the ds
+	uf, aof, _, err := GetUUIDFile(uid, userEncSymKey, userHmacKey)
+	if err != nil {
+		return err
+	}
+	// INFO: key generations
+	fileEncKey, encKeyErr := EncSymKeyGen(uf.SymKey)
+	if encKeyErr != nil {
+		return encKeyErr
+	}
+	fileHmacKey, hmacKeyErr := HmacKeyGen(uf.SymKey)
+	if hmacKeyErr != nil {
+		return hmacKeyErr
+	}
+	// INFO: check whether an invitation graph exists.
+	id, err := UUIDOfInvitationGraph(userdata.Username, filename)
+	if err != nil {
+		return err
+	}
+	// INFO: check whether the file have been shared to rec
+	var ig *InvitationGraph
+	err = DatastoreSymGet(userEncSymKey, userHmacKey, id, ig)
+	_, ok := (*ig)[recipientUsername]
+	if !ok {
+		return &DatastoreGetError{fmt.Sprintf("file not share to %s", recipientUsername)}
+	}
+	// INFO: remove the rec
+	delete(*ig, recipientUsername)
+	// INFO: change the uuid of file head
+	newFhId := uuid.New()
+	err = moveFileHead(fileEncKey, fileHmacKey, *aof, newFhId)
+	// INFO: iterate the invitation graph, update the aof in the uuidBranch
+	for key := range *ig {
+		err = DatastoreSymSet(fileEncKey, fileHmacKey, (*ig)[key], newFhId)
+		if err != nil {
+			return err
+		}
+	}
+	// INFO: write back the ig
+	err = DatastoreSymSet(userEncSymKey, userHmacKey, id, ig)
+	if err != nil {
+		return err
+	}
+	// INFO: write back to the uf.UUID
+	err = DatastoreSymSet(userEncSymKey, userHmacKey, uf.UUID, newFhId)
+	if err != nil {
+		return err
+	}
 	return nil
 }
