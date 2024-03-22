@@ -194,6 +194,9 @@ func getUuidFromUsername(username string, start int) (id uuid.UUID, err error) {
 }
 
 func ValidateUser(username string, exist bool) (valid bool) {
+	if username == "" {
+		return false
+	}
 	userUUID, err := getUuidFromUsername(username, 0)
 	if err == nil {
 		_, ok := userlib.DatastoreGet(userUUID)
@@ -414,10 +417,8 @@ func ReinitializeFile(addOfFileHead *uuid.UUID, fh *FileHead, encKey []byte, hma
 		userlib.DatastoreDelete(id)
 	}
 	// INFO: reset a new FileHead and then write it back to the database
-	fh = &FileHead{
-		Start:   userlib.RandomBytes(16),
-		Counter: 0,
-	}
+	fh.Start = userlib.RandomBytes(16)
+	fh.Counter = 0
 	datastoreSetErr := DatastoreSymSet(encKey, hmacKey, *addOfFileHead, fh)
 	return datastoreSetErr
 }
@@ -515,7 +516,7 @@ func InitUser(username string, password string) (userDataPtr *User, err error) {
 	// INFO: validate the username
 	valid := ValidateUser(username, false)
 	if !valid {
-		return nil, &DatastoreGetError{"username exists"}
+		return nil, &DatastoreGetError{"username exists or is empty"}
 	}
 	// INFO: generate symmetric key for a specific (password, username)
 	userdata.Username = username
