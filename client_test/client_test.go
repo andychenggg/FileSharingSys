@@ -164,10 +164,10 @@ var _ = Describe("Client Tests", func() {
 	var alice *client.User
 	var bob *client.User
 	var charles *client.User
-	// var doris *client.User
-	// var eve *client.User
-	// var frank *client.User
-	// var grace *client.User
+	//var doris *client.User
+	//var eve *client.User
+	//var frank *client.User
+	//var grace *client.User
 	// var horace *client.User
 	// var ira *client.User
 
@@ -182,10 +182,10 @@ var _ = Describe("Client Tests", func() {
 	aliceFile := "aliceFile.txt"
 	bobFile := "bobFile.txt"
 	charlesFile := "charlesFile.txt"
-	// dorisFile := "dorisFile.txt"
-	// eveFile := "eveFile.txt"
-	// frankFile := "frankFile.txt"
-	// graceFile := "graceFile.txt"
+	const dorisFile = "dorisFile.txt"
+	const eveFile = "eveFile.txt"
+	const frankFile = "frankFile.txt"
+	const graceFile = "graceFile.txt"
 	// horaceFile := "horaceFile.txt"
 	// iraFile := "iraFile.txt"
 
@@ -544,4 +544,300 @@ var _ = Describe("Client Tests", func() {
 			}
 		})
 	})
+
+	Describe("Sharing and Revocation Test", func() {
+		Specify("Share then read, store, append to, share", func() {
+			alice, err = client.InitUser("alice", defaultPassword)
+			bob, err = client.InitUser("bob", defaultPassword)
+			charles, err = client.InitUser("charles", defaultPassword)
+
+			err = alice.StoreFile("\n", []byte(contentOne))
+			Expect(err).To(BeNil())
+
+			// INFO: share to bob
+			userlib.DebugMsg("INFO: share to bob")
+			ip, err := alice.CreateInvitation("\n", "bob")
+			Expect(err).To(BeNil())
+			err = bob.AcceptInvitation("alice", ip, bobFile)
+			Expect(err).To(BeNil())
+			// INFO: share to bob
+			userlib.DebugMsg("INFO: bob shares the file to charles")
+			ip, err = bob.CreateInvitation(bobFile, "charles")
+			Expect(err).To(BeNil())
+			err = charles.AcceptInvitation("bob", ip, charlesFile)
+			Expect(err).To(BeNil())
+
+			// INFO: read, overwrite and append to
+			userlib.DebugMsg("INFO: read, overwrite and append to")
+			data, err := bob.LoadFile(bobFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentOne)))
+
+			err = bob.StoreFile(bobFile, []byte(contentThree))
+			Expect(err).To(BeNil())
+			data, err = alice.LoadFile("\n")
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentThree)))
+
+			err = alice.StoreFile("\n", []byte(contentTwo))
+			Expect(err).To(BeNil())
+			data, err = bob.LoadFile(bobFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentTwo)))
+
+			err = alice.AppendToFile("\n", []byte(contentThree))
+			Expect(err).To(BeNil())
+			err = bob.AppendToFile(bobFile, []byte(contentOne))
+			Expect(err).To(BeNil())
+			err = charles.AppendToFile(charlesFile, []byte(contentTwo))
+			Expect(err).To(BeNil())
+			data, err = alice.LoadFile("\n")
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentTwo + contentThree + contentOne + contentTwo)))
+			data, err = bob.LoadFile(bobFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentTwo + contentThree + contentOne + contentTwo)))
+			data, err = charles.LoadFile(charlesFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentTwo + contentThree + contentOne + contentTwo)))
+
+		})
+
+		Specify("Create Invitation", func() {
+			alice, err = client.InitUser("alice", defaultPassword)
+			bob, err = client.InitUser("bob", defaultPassword)
+
+			err = alice.StoreFile("\n", []byte(contentOne))
+			Expect(err).To(BeNil())
+
+			// INFO: non-exist file
+			userlib.DebugMsg("INFO: non-exist file")
+			_, err := alice.CreateInvitation("\t", "bob")
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+
+			// INFO: non-exist user
+			userlib.DebugMsg("INFO: non-exist user")
+			_, err = alice.CreateInvitation("\n", "bob2")
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+		})
+
+		Specify("Accept Invitation", func() {
+			alice, err = client.InitUser("alice", defaultPassword)
+			bob, err = client.InitUser("bob", defaultPassword)
+			charles, err = client.InitUser("charles", defaultPassword)
+
+			err = alice.StoreFile("\n", []byte(contentOne))
+			Expect(err).To(BeNil())
+			err = bob.StoreFile(bobFile, []byte(contentOne))
+			Expect(err).To(BeNil())
+			err = charles.StoreFile(charlesFile, []byte(contentOne))
+			Expect(err).To(BeNil())
+
+			// INFO: choose a repeat filename
+			userlib.DebugMsg("INFO: choose a repeat filename")
+			ip, err := alice.CreateInvitation("\n", "bob")
+			Expect(err).To(BeNil())
+			err = bob.AcceptInvitation("alice", ip, bobFile)
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+
+			// INFO: invalid ptr
+			ip = uuid.New()
+			err = bob.AcceptInvitation("alice", ip, "\n")
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+
+			// INFO: ptr from another user
+			ip, err = charles.CreateInvitation(charlesFile, "bob")
+			err = bob.AcceptInvitation("alice", ip, "\n")
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+			err = bob.AcceptInvitation("charles", ip, "\n")
+			Expect(err).To(BeNil())
+		})
+
+		Specify("Revocation Tests: ", func() {
+			alice, err = client.InitUser("alice", defaultPassword)
+			bob, err = client.InitUser("bob", defaultPassword)
+			charles, err = client.InitUser("charles", defaultPassword)
+			_, err := client.InitUser("doris", defaultPassword)
+
+			err = alice.StoreFile(aliceFile, []byte(contentOne))
+			Expect(err).To(BeNil())
+			// INFO: A invites B
+			ip, err := alice.CreateInvitation(aliceFile, "bob")
+			Expect(err).To(BeNil())
+			err = bob.AcceptInvitation("alice", ip, bobFile)
+			Expect(err).To(BeNil())
+			// INFO: A invites C
+			ip, err = alice.CreateInvitation(aliceFile, "charles")
+			Expect(err).To(BeNil())
+			err = charles.AcceptInvitation("alice", ip, charlesFile)
+			Expect(err).To(BeNil())
+			// INFO: try to load
+			_, err = bob.LoadFile(bobFile)
+			Expect(err).To(BeNil())
+			// INFO: A revokes B
+			err = alice.RevokeAccess(aliceFile, "bob")
+			Expect(err).To(BeNil())
+			_, err = bob.LoadFile(bobFile)
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+			err = bob.AppendToFile(bobFile, []byte(contentOne))
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+			// INFO: C can still access it
+			err = charles.AppendToFile(charlesFile, []byte(contentTwo))
+			Expect(err).To(BeNil())
+			data, err := charles.LoadFile(charlesFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentOne + contentTwo)))
+
+			// INFO: revocation with wrong username
+			err = alice.RevokeAccess(aliceFile, "charles1")
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+			err = alice.RevokeAccess(aliceFile, "doris")
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+
+			// INFO: revocation with wrong filename
+			err = alice.RevokeAccess(aliceFile+"1", "charles")
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+
+		})
+
+		/**
+		A: [
+			B: [
+				D: [
+					F
+				],
+				E
+			],
+			C: [
+				G
+			]
+		]
+		*/
+		Specify("Complicate Invitation Graph: ", func() {
+			alice, err = client.InitUser("alice", defaultPassword)
+			bob, err = client.InitUser("bob", defaultPassword)
+			charles, err = client.InitUser("charles", defaultPassword)
+			doris, err := client.InitUser("doris", defaultPassword)
+			Expect(err).To(BeNil())
+			eve, err := client.InitUser("eve", defaultPassword)
+			Expect(err).To(BeNil())
+			frank, err := client.InitUser("frank", defaultPassword)
+			Expect(err).To(BeNil())
+			grace, err := client.InitUser("grace", defaultPassword)
+			Expect(err).To(BeNil())
+
+			err = alice.StoreFile(aliceFile, []byte(contentOne))
+			Expect(err).To(BeNil())
+			// INFO: A invites B, C
+			ip, err := alice.CreateInvitation(aliceFile, "bob")
+			Expect(err).To(BeNil())
+			err = bob.AcceptInvitation("alice", ip, bobFile)
+			Expect(err).To(BeNil())
+			ip, err = alice.CreateInvitation(aliceFile, "charles")
+			Expect(err).To(BeNil())
+			err = charles.AcceptInvitation("alice", ip, charlesFile)
+			Expect(err).To(BeNil())
+			// INFO: B invites D, E
+			ip, err = bob.CreateInvitation(bobFile, "doris")
+			Expect(err).To(BeNil())
+			err = doris.AcceptInvitation("bob", ip, dorisFile)
+			Expect(err).To(BeNil())
+			ip, err = bob.CreateInvitation(bobFile, "eve")
+			Expect(err).To(BeNil())
+			err = eve.AcceptInvitation("bob", ip, eveFile)
+			Expect(err).To(BeNil())
+			// INFO: D invites F
+			ip, err = doris.CreateInvitation(dorisFile, "frank")
+			Expect(err).To(BeNil())
+			err = frank.AcceptInvitation("doris", ip, frankFile)
+			Expect(err).To(BeNil())
+			// INFO: C invites G
+			ip, err = charles.CreateInvitation(charlesFile, "grace")
+			Expect(err).To(BeNil())
+			err = grace.AcceptInvitation("charles", ip, graceFile)
+			Expect(err).To(BeNil())
+
+			// INFO: F load the file
+			data, err := frank.LoadFile(frankFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentOne)))
+			// INFO: A changes the file, F loads it
+			err = alice.StoreFile(aliceFile, []byte(contentTwo))
+			Expect(err).To(BeNil())
+			data, err = frank.LoadFile(frankFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentTwo)))
+			// INFO: F append to it, G loads it
+			err = frank.AppendToFile(frankFile, []byte(contentThree))
+			Expect(err).To(BeNil())
+			data, err = grace.LoadFile(graceFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentTwo + contentThree)))
+			// INFO: G overwrite it, B loads it
+			err = grace.StoreFile(graceFile, []byte(contentOne))
+			Expect(err).To(BeNil())
+			data, err = bob.LoadFile(bobFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentOne)))
+			// INFO: B append to it, C loads it
+			err = bob.AppendToFile(bobFile, []byte(contentThree))
+			Expect(err).To(BeNil())
+			data, err = charles.LoadFile(charlesFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentOne + contentThree)))
+			// INFO: C appends to it, D loads it
+			err = charles.AppendToFile(charlesFile, []byte(contentTwo))
+			Expect(err).To(BeNil())
+			data, err = doris.LoadFile(dorisFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentOne + contentThree + contentTwo)))
+			// INFO: D overwrites it, A, E loads it
+			err = doris.StoreFile(dorisFile, []byte(contentThree))
+			Expect(err).To(BeNil())
+			data, err = alice.LoadFile(aliceFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentThree)))
+			data, err = eve.LoadFile(eveFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentThree)))
+
+			// INFO: A revokes B, F try to append and load
+			userlib.DebugMsg("INFO: A revokes B, F try to append and load")
+			err = alice.StoreFile(aliceFile, []byte(contentOne))
+			Expect(err).To(BeNil())
+			err = alice.RevokeAccess(aliceFile, "bob")
+			Expect(err).To(BeNil())
+			_, err = frank.LoadFile(frankFile)
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+			err = frank.AppendToFile(frankFile, []byte(contentOne))
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+			// INFO: G can still access it
+			userlib.DebugMsg("INFO: G can still access it")
+			err = grace.AppendToFile(graceFile, []byte(contentTwo))
+			Expect(err).To(BeNil())
+			data, err = charles.LoadFile(charlesFile)
+			Expect(err).To(BeNil())
+			Expect(data).To(Equal([]byte(contentOne + contentTwo)))
+			// INFO: E tries to load and append
+			_, err = frank.LoadFile(frankFile)
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+			err = frank.AppendToFile(frankFile, []byte(contentOne))
+			Expect(err).NotTo(BeNil())
+			fmt.Printf("err: %s\n", err)
+		})
+	})
+
 })

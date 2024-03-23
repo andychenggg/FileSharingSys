@@ -751,10 +751,11 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		return nil, &DatastoreGetError{"file name does not exist in the namespace"}
 	} else {
 		// INFO: get the file structure
-		uf, _, fh, err := GetUUIDFile(storageKey, userEncSymKey, userHmacKey)
+		uf, aof, fh, err := GetUUIDFile(storageKey, userEncSymKey, userHmacKey)
 		if err != nil {
 			return nil, err
 		}
+		fmt.Println(*aof)
 		// INFO: generate keys for this file's encryption/decryption and hmac
 		fileEncSymKey, fileEncSymKeyErr := EncSymKeyGen(uf.SymKey)
 		if fileEncSymKeyErr != nil {
@@ -828,7 +829,7 @@ func (userdata *User) CreateInvitation(filename string, recipientUsername string
 		uuidBranch = uuid.New()
 		(*ig)[recipientUsername] = uuidBranch
 		// INFO: let uuidBranch point to the fileHead
-		err = DatastoreSymSet(fileEncKey, fileHmacKey, uuidBranch, *aof)
+		err = DatastoreSymSet(fileEncKey, fileHmacKey, uuidBranch, aof)
 		if err != nil {
 			return uuid.New(), err
 		}
